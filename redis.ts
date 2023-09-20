@@ -43,7 +43,7 @@ import type {
 } from "./command.ts";
 import { RedisConnection } from "./connection.ts";
 import type { Connection, SendCommandOptions } from "./connection.ts";
-import type { BaseRedisConnectionOptions } from "./connection.ts";
+import type { RedisConnectionOptions } from "./connection.ts";
 import { CommandExecutor, DefaultExecutor } from "./executor.ts";
 import type {
   Binary,
@@ -2358,28 +2358,6 @@ class RedisImpl implements Redis {
     return createRedisPipeline(this.executor.connection);
   }
 }
-
-interface RedisConnectionOptionsTCP extends BaseRedisConnectionOptions {
-  tls?: boolean;
-  hostname: string;
-  port?: number | string;
-}
-
-interface RedisConnectionOptionsUnix extends BaseRedisConnectionOptions {
-  path: string;
-}
-
-// @ts-ignore: Exploiting missing type resolving to `any` to detect if `UnixConnectOptions` is in type scope:
-type ExtendsUCO<T> = T extends Deno.UnixConnectOptions ? true : false;
-type ValidUCO = ExtendsUCO<{ path: string; transport: "unix" }>;
-type InvalidUCO = ExtendsUCO<{ transport: "not-unix" }>;
-type HasUCO = ValidUCO extends false ? never
-  : InvalidUCO extends true ? never
-  : {};
-
-export type RedisConnectionOptions =
-  | RedisConnectionOptionsTCP
-  | (HasUCO & RedisConnectionOptionsUnix);
 
 /** @deprecated Use `RedisConnectionOptons` instead */
 export type RedisConnectOptions = RedisConnectionOptions;
