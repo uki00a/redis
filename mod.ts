@@ -54,6 +54,7 @@ export type {
   ZUnionstoreOpts,
 } from "./command.ts";
 export type {
+  BaseRedisConnectionOptions,
   Connection,
   RedisConnectionOptions,
   SendCommandOptions,
