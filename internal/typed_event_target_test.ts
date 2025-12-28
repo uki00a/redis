@@ -1,4 +1,8 @@
-import { on } from "./on.ts";
+import {
+  createTypedEventTarget,
+  dispatchEvent,
+  on,
+} from "./typed_event_target.ts";
 import {
   assert,
   assertEquals,
@@ -11,7 +15,7 @@ Deno.test({
   fn: async (t) => {
     await t.step("implements [Symbol.asyncIterator]", async () => {
       const eventType = "foo";
-      const target = new EventTarget();
+      const target = createTypedEventTarget<Record<"foo", number>>();
       const ac = new AbortController();
       const iter = on(target, eventType, { signal: ac.signal });
       const events: Array<Event> = [];
@@ -24,10 +28,15 @@ Deno.test({
           }
         }
       })();
-      target.dispatchEvent(new CustomEvent(eventType));
-      target.dispatchEvent(new CustomEvent(eventType + "bar"));
-      target.dispatchEvent(new CustomEvent(eventType));
-      target.dispatchEvent(new CustomEvent(eventType));
+      dispatchEvent(target, eventType, 123);
+      dispatchEvent(
+        target,
+        // @ts-expect-error -- Intentionally triggering an invalid event.
+        eventType + "bar",
+        undefined,
+      );
+      dispatchEvent(target, eventType, 123);
+      dispatchEvent(target, eventType, 123);
       await promise;
       assertEquals(await iter.next(), { done: true, value: undefined });
       assertStrictEquals(events.length, 3);
@@ -35,20 +44,20 @@ Deno.test({
 
     await t.step("implements Symbol.asyncIterator#return()", async () => {
       const eventType = "bar";
-      const target = new EventTarget();
+      const target = createTypedEventTarget<Record<"bar", number>>();
       const ac = new AbortController();
       const iter = on(target, eventType, { signal: ac.signal });
 
-      target.dispatchEvent(new CustomEvent(eventType));
+      dispatchEvent(target, eventType, 45);
       const result = await iter.next();
       assertStrictEquals(result.done, false);
       assertStrictEquals(result.value.type, eventType);
 
       assert(iter.return != null);
-      iter.return();
+      iter.return?.();
 
       assertEquals(await iter.next(), { done: true, value: undefined });
-      target.dispatchEvent(new CustomEvent(eventType));
+      dispatchEvent(target, eventType, 67);
       assertEquals(await iter.next(), { done: true, value: undefined });
     });
   },

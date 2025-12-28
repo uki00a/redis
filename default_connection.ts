@@ -11,12 +11,16 @@ import {
   isRetriableError,
 } from "./errors.ts";
 import type { ConnectionEventMap } from "./events.ts";
+import type { Channel } from "./internal/channel.ts";
+import { createChannel } from "./internal/channel.ts";
 import {
   kUnstableCreateProtocol,
+  kUnstableEnterSubscriptionMode,
+  kUnstableLeaveSubscriptionMode,
   kUnstablePipeline,
   kUnstableProtover,
   kUnstableReadReply,
-  kUnstableStartReadLoop,
+  kUnstableStartSubscriptionLoop,
   kUnstableWriteCommand,
 } from "./internal/symbols.ts";
 import type { TypedEventTarget } from "./internal/typed_event_target.ts";
@@ -27,7 +31,11 @@ import {
 import { kEmptyRedisArgs } from "./protocol/shared/command.ts";
 import type { Command, Protocol } from "./protocol/shared/protocol.ts";
 import { Protocol as DenoStreamsProtocol } from "./protocol/deno_streams/mod.ts";
-import type { RedisReply, RedisValue } from "./protocol/shared/types.ts";
+import type {
+  Protover,
+  RedisReply,
+  RedisValue,
+} from "./protocol/shared/types.ts";
 import { delay } from "./deps/std/async.ts";
 
 export function createRedisConnection(
@@ -58,6 +66,8 @@ class RedisConnection
   private commandQueue: PendingCommand[] = [];
   #conn!: Deno.Conn;
   #protocol!: Protocol;
+  /** @default {2} */
+  #protover?: Protover;
   #eventTarget = createTypedEventTarget<ConnectionEventMap>();
   #connectingPromise?: PromiseWithResolvers<void>;
 
@@ -134,12 +144,29 @@ class RedisConnection
     args?: Array<RedisValue>,
     options?: SendCommandOptions,
   ): Promise<RedisReply> {
-    const execute = () =>
-      this.#protocol.sendCommand(
-        command,
-        args ?? kEmptyRedisArgs,
-        options?.returnUint8Arrays,
-      );
+    const execute = this.#isRESP3SubscriptionActive
+      ? async () => {
+        await this.#protocol.writeCommand({
+          command,
+          args: args ?? kEmptyRedisArgs,
+        });
+        const readNextReply = async () => {
+          const { isPushReply, reply } = await this.#protocol
+            .tryToReadPushReply();
+          if (isPushReply) {
+            this.#pushReplyChannel?.send(reply);
+            return readNextReply(); // Keep retrying until a non-PUSH reply is read.
+          }
+          return reply;
+        };
+        return readNextReply();
+      }
+      : () =>
+        this.#protocol.sendCommand(
+          command,
+          args ?? kEmptyRedisArgs,
+          options?.returnUint8Arrays,
+        );
     const { promise, resolve, reject } = Promise.withResolvers<RedisReply>();
     this.enqueueCommand({ execute, resolve, reject });
 
@@ -208,33 +235,65 @@ class RedisConnection
     return this.#protocol.writeCommand(command);
   }
 
-  async *[kUnstableStartReadLoop](
+  [kUnstableEnterSubscriptionMode](): void {
+    this.#isRESP3SubscriptionActive = this.#protover === 3;
+    if (this.#isRESP3SubscriptionActive) {
+      if (this.#pushReplyChannel) {
+        throw new InvalidStateError("Already entered subscription mode");
+      }
+      this.#pushReplyChannel = createChannel();
+    }
+  }
+
+  [kUnstableLeaveSubscriptionMode](): void {
+    this.#isRESP3SubscriptionActive = false;
+    if (this.#pushReplyChannel) {
+      this.#pushReplyChannel.close();
+    }
+  }
+
+  #isRESP3SubscriptionActive = false;
+  #pushReplyChannel?: Channel<RedisReply>;
+  async *[kUnstableStartSubscriptionLoop](
     binaryMode?: boolean,
   ): AsyncIterableIterator<RedisReply> {
     let forceReconnect = false;
-    while (this.isConnected) {
-      try {
-        let rep: RedisReply;
+    const resp3Reader = async () => {
+      if (this.#pushReplyChannel == null) {
+        throw new InvalidStateError("pushReplyChannel should be defined");
+      }
+      const reply = await this.#pushReplyChannel?.receive();
+      return reply;
+    };
+    const resp2Reader = () => this[kUnstableReadReply](binaryMode);
+    const reader = this.#protover === 3 ? resp3Reader : resp2Reader;
+    try {
+      while (this.isConnected) {
         try {
-          rep = await this[kUnstableReadReply](binaryMode);
-        } catch (err) {
-          if (this.isClosed) {
-            // Connection already closed by the user.
-            break;
+          let pushReply: RedisReply;
+          try {
+            pushReply = await reader();
+          } catch (err) {
+            if (this.isClosed) {
+              // Connection already closed by the user.
+              break;
+            }
+            throw err; // Connection may have been unintentionally closed.
           }
-          throw err; // Connection may have been unintentionally closed.
-        }
-        yield rep;
-      } catch (error) {
-        if (isRetriableError(error)) {
-          forceReconnect = true;
-        } else throw error;
-      } finally {
-        if ((!this.isClosed && !this.isConnected) || forceReconnect) {
-          forceReconnect = false;
-          await this.reconnect();
+          yield pushReply;
+        } catch (error) {
+          if (isRetriableError(error)) {
+            forceReconnect = true;
+          } else throw error;
+        } finally {
+          if ((!this.isClosed && !this.isConnected) || forceReconnect) {
+            forceReconnect = false;
+            await this.reconnect();
+          }
         }
       }
+    } finally {
+      this[kUnstableLeaveSubscriptionMode]();
     }
   }
 
@@ -292,9 +351,11 @@ class RedisConnection
           await this.authenticate(this.options.username, this.options.password);
         }
         if (this.options[kUnstableProtover] != null) {
-          await this.#sendCommandImmediately("HELLO", [
-            this.options[kUnstableProtover],
-          ]);
+          const protover = this.options[kUnstableProtover];
+          await this.#sendCommandImmediately("HELLO", [protover]);
+          if (protover !== 2) {
+            this.#protover = protover;
+          }
         }
         if (this.options.db) {
           await this.selectDb(this.options.db);
@@ -356,6 +417,7 @@ class RedisConnection
         }
       }
     }
+    this[kUnstableLeaveSubscriptionMode]();
   }
 
   async reconnect(): Promise<void> {
