@@ -27,7 +27,11 @@ import {
 import { kEmptyRedisArgs } from "./protocol/shared/command.ts";
 import type { Command, Protocol } from "./protocol/shared/protocol.ts";
 import { Protocol as DenoStreamsProtocol } from "./protocol/deno_streams/mod.ts";
-import type { RedisReply, RedisValue } from "./protocol/shared/types.ts";
+import type {
+  Protover,
+  RedisReply,
+  RedisValue,
+} from "./protocol/shared/types.ts";
 import { delay } from "./deps/std/async.ts";
 
 export function createRedisConnection(
@@ -58,6 +62,8 @@ class RedisConnection
   private commandQueue: PendingCommand[] = [];
   #conn!: Deno.Conn;
   #protocol!: Protocol;
+  /** @default {2} */
+  #protover?: Protover;
   #eventTarget = createTypedEventTarget<ConnectionEventMap>();
   #connectingPromise?: PromiseWithResolvers<void>;
 
@@ -292,9 +298,11 @@ class RedisConnection
           await this.authenticate(this.options.username, this.options.password);
         }
         if (this.options[kUnstableProtover] != null) {
-          await this.#sendCommandImmediately("HELLO", [
-            this.options[kUnstableProtover],
-          ]);
+          const protover = this.options[kUnstableProtover];
+          await this.#sendCommandImmediately("HELLO", [protover]);
+          if (protover !== 2) {
+            this.#protover = protover;
+          }
         }
         if (this.options.db) {
           await this.selectDb(this.options.db);
